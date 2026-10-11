@@ -1,0 +1,54 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+.env
+.env.*
+!.env.example
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Vite artifacts
+stats.html
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+backend/__pycache__/
+backend/.venv/
+.venv/
+venv/
+# Coverage reports
+.coverage
+coverage/
+backend/.coverage
+backend/coverage.xml
+backend/.flake8
+*.db
+pnpm-lock.yaml
+venv_test/  
+.vercel
+
+.vercel
+.env*

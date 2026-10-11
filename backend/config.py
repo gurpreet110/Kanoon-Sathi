@@ -1,0 +1,861 @@
+"""
+Centralized Configuration Management
+
+This module provides a single source of truth for all environment configuration
+with comprehensive validation, type safety, and clear error messages.
+
+All environment variables are validated at startup using Pydantic Settings,
+ensuring invalid configurations fail fast with descriptive error messages.
+"""
+
+import os
+from typing import Literal, Optional
+from pydantic import (
+    Field,
+    field_validator,
+    model_validator,
+    ValidationError,
+    ConfigDict,
+    AliasChoices,
+)
+from pydantic_settings import BaseSettings
+import logging
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+
+class DatabaseConfig(BaseSettings):
+    """Database configuration settings."""
+    
+    model_config = ConfigDict(env_prefix="", case_sensitive=False)
+    
+    database_url: Optional[str] = Field(
+        default=None,
+        description="Database connection URL. Falls back to SQLite if not provided."
+    )
+    vercel: Optional[str] = Field(
+        default=None,
+        description="Vercel environment indicator."
+    )
+    redis_url: Optional[str] = Field(
+        default=None,
+        description="Redis URL for distributed rate limiting."
+    )
+
+
+class SecurityConfig(BaseSettings):
+    """Security and authentication configuration."""
+    
+    model_config = ConfigDict(env_prefix="", case_sensitive=False)
+    
+    jwt_secret_key: str = Field(
+        ...,
+        description="JWT secret key for token signing. Required in all environments."
+    )
+    api_keys: str = Field(
+        default="",
+        description="Comma-separated list of valid API keys."
+    )
+    allow_dev: bool = Field(
+        default=False,
+        description="Allow development mode API keys."
+    )
+    dev_api_key: str = Field(
+        default="dev-token",
+        description="Development mode API key."
+    )
+    
+    # Refresh token configuration
+    refresh_token_expire_days: int = Field(
+        default=7,
+        description="Refresh token expiration time in days."
+    )
+    refresh_token_cookie_name: str = Field(
+        default="refresh_token",
+        description="Name of the refresh token cookie."
+    )
+    refresh_token_rotation_enabled: bool = Field(
+        default=True,
+        description="Enable refresh token rotation on each refresh request."
+    )
+    
+    @field_validator('jwt_secret_key')
+    @classmethod
+    def validate_jwt_secret_key(cls, v: str) -> str:
+        """Validate JWT secret key is not empty and has reasonable length."""
+        if not v or not v.strip():
+            raise ValueError('JWT_SECRET_KEY cannot be empty')
+        if len(v) < 16:
+            logger.warning(
+                "JWT_SECRET_KEY is shorter than recommended 16 characters. "
+                "Consider using a stronger secret."
+            )
+        return v
+    
+    @field_validator('refresh_token_expire_days')
+    @classmethod
+    def validate_refresh_token_expire_days(cls, v: int) -> int:
+        """Validate refresh token expiration is positive and reasonable."""
+        if v <= 0:
+            raise ValueError('REFRESH_TOKEN_EXPIRE_DAYS must be greater than 0')
+        if v > 365:
+            logger.warning(
+                f"REFRESH_TOKEN_EXPIRE_DAYS ({v} days) is very long. "
+                "Consider using a shorter duration for better security."
+            )
+        return v
+
+
+class EnvironmentConfig(BaseSettings):
+    """Environment and deployment configuration."""
+    
+    model_config = ConfigDict(env_prefix="", case_sensitive=False)
+    
+    environment: Literal["development", "testing", "staging", "production", "local"] = Field(
+        default="production",
+        description="Application environment."
+    )
+    
+    @field_validator("environment", mode="before")
+    @classmethod
+    def coerce_environment_lowercase(cls, v):
+        if isinstance(v, str):
+            return v.lower()
+        return v
+    test_mode: bool = Field(
+        default=False,
+        description="Enable test mode for controlled failure simulation."
+    )
+    test_verification_failure_emails: str = Field(
+        default="",
+        description="Comma-separated list of email addresses that trigger simulated verification failures in test mode."
+    )
+    test_failure_email_patterns: str = Field(
+        default="fail",
+        description="Comma-separated list of email patterns that trigger simulated verification failures in test mode."
+    )
+    
+    @field_validator("test_verification_failure_emails", "test_failure_email_patterns", mode="before")
+    @classmethod
+    def coerce_string_to_lowercase(cls, v):
+        """Convert string configuration values to lowercase for consistency."""
+        if isinstance(v, str):
+            return v.lower()
+        return v
+    
+    @model_validator(mode='before')
+    @classmethod
+    def default_testing_environment_if_test_mode(cls, data):
+        if isinstance(data, dict):
+            test_mode = data.get("test_mode")
+            if isinstance(test_mode, str):
+                test_mode = test_mode.lower() in ("true", "1", "yes")
+            if test_mode and "environment" not in data:
+                data = dict(data)
+                data["environment"] = "testing"
+        return data
+
+    @model_validator(mode='after')
+    def validate_test_mode_environment(self):
+        """Ensure test_mode is only enabled in non-production environments."""
+        # Check the field value, not environment variable
+        if self.environment == "production" and self.test_mode:
+            raise ValueError(
+                "TEST_MODE cannot be enabled in production environment. "
+                "Set ENVIRONMENT to development, testing, or staging to enable test mode."
+            )
+        return self
+
+
+class FileUploadConfig(BaseSettings):
+    """File upload and processing configuration."""
+    
+    model_config = ConfigDict(env_prefix="", case_sensitive=False)
+    
+    max_upload_size: int = Field(
+        default=25 * 1024 * 1024,
+        description="Maximum file upload size in bytes."
+    )
+    max_pdf_pages: int = Field(
+        default=100,
+        description="Maximum number of PDF pages to process."
+    )
+    max_docx_paragraphs: int = Field(
+        default=2000,
+        description="Maximum number of DOCX paragraphs to process."
+    )
+    max_extracted_text_chars: int = Field(
+        default=10000,
+        description="Maximum characters of text to extract from documents."
+    )
+    upload_parse_timeout_seconds: float = Field(
+        default=5.0,
+        description="Timeout in seconds for document parsing."
+    )
+    token_cleanup_interval_seconds: int = Field(
+        default=3600,
+        description="Interval in seconds for token cleanup task."
+    )
+    upload_task_cleanup_interval_seconds: int = Field(
+        default=300,
+        description="Interval in seconds for automatic cleanup of expired upload tasks in in-memory storage."
+    )
+    
+    @field_validator('max_upload_size')
+    @classmethod
+    def validate_max_upload_size(cls, v: int) -> int:
+        """Validate max upload size is positive and reasonable."""
+        if v <= 0:
+            raise ValueError('MAX_UPLOAD_SIZE must be greater than 0')
+        if v > 1024 * 1024 * 1024:  # 1GB
+            logger.warning(
+                f"MAX_UPLOAD_SIZE ({v} bytes) is very large. "
+                "Consider setting a lower limit to prevent memory issues."
+            )
+        return v
+    
+    @field_validator('max_pdf_pages')
+    @classmethod
+    def validate_max_pdf_pages(cls, v: int) -> int:
+        """Validate max PDF pages is positive and reasonable."""
+        if v <= 0:
+            raise ValueError('MAX_PDF_PAGES must be greater than 0')
+        if v > 1000:
+            logger.warning(
+                f"MAX_PDF_PAGES ({v}) is very large. "
+                "Consider setting a lower limit to prevent processing timeouts."
+            )
+        return v
+    
+    @field_validator('max_docx_paragraphs')
+    @classmethod
+    def validate_max_docx_paragraphs(cls, v: int) -> int:
+        """Validate max DOCX paragraphs is positive."""
+        if v <= 0:
+            raise ValueError('MAX_DOCX_PARAGRAPHS must be greater than 0')
+        return v
+    
+    @field_validator('max_extracted_text_chars')
+    @classmethod
+    def validate_max_extracted_text_chars(cls, v: int) -> int:
+        """Validate max extracted text chars is positive."""
+        if v <= 0:
+            raise ValueError('MAX_EXTRACTED_TEXT_CHARS must be greater than 0')
+        return v
+    
+    @field_validator('upload_parse_timeout_seconds')
+    @classmethod
+    def validate_upload_parse_timeout_seconds(cls, v: float) -> float:
+        """Validate upload parse timeout is positive and reasonable."""
+        if v <= 0:
+            raise ValueError('UPLOAD_PARSE_TIMEOUT_SECONDS must be greater than 0')
+        if v > 300:  # 5 minutes
+            logger.warning(
+                f"UPLOAD_PARSE_TIMEOUT_SECONDS ({v}s) is very large. "
+                "Consider setting a lower limit to prevent hanging requests."
+            )
+        return v
+    
+    @field_validator('token_cleanup_interval_seconds')
+    @classmethod
+    def validate_token_cleanup_interval_seconds(cls, v: int) -> int:
+        """Validate token cleanup interval is positive."""
+        if v <= 0:
+            raise ValueError('TOKEN_CLEANUP_INTERVAL_SECONDS must be greater than 0')
+        return v
+    
+    @field_validator('upload_task_cleanup_interval_seconds')
+    @classmethod
+    def validate_upload_task_cleanup_interval_seconds(cls, v: int) -> int:
+        """Validate upload task cleanup interval is positive."""
+        if v <= 0:
+            raise ValueError('UPLOAD_TASK_CLEANUP_INTERVAL_SECONDS must be greater than 0')
+        return v
+
+
+class InputValidationConfig(BaseSettings):
+    """Input validation limits configuration."""
+    
+    model_config = ConfigDict(env_prefix="", case_sensitive=False)
+    
+    max_chat_input_chars: int = Field(
+        default=4000,
+        description="Maximum characters for chat input."
+    )
+    max_summarize_input_chars: int = Field(
+        default=20000,
+        description="Maximum characters for summarization input."
+    )
+    max_simplify_input_chars: int = Field(
+        default=10000,
+        description="Maximum characters for simplification input."
+    )
+    max_context_input_chars: int = Field(
+        default=10000,
+        description="Maximum characters for document context input."
+    )
+    max_docx_archive_entries: int = Field(
+        default=200,
+        description="Maximum number of entries in DOCX archive."
+    )
+    max_docx_archive_uncompressed_bytes: int = Field(
+        default=10 * 1024 * 1024,
+        description="Maximum uncompressed bytes for DOCX archive."
+    )
+    max_docx_archive_entry_bytes: int = Field(
+        default=5 * 1024 * 1024,
+        description="Maximum bytes for single DOCX archive entry."
+    )
+    max_docx_archive_ratio: float = Field(
+        default=100.0,
+        description="Maximum compression ratio for DOCX archive."
+    )
+    max_docx_xml_bytes: int = Field(
+        default=5 * 1024 * 1024,
+        description="Maximum bytes for DOCX XML content."
+    )
+    
+    @field_validator('max_chat_input_chars', 'max_summarize_input_chars', 
+                   'max_simplify_input_chars', 'max_context_input_chars')
+    @classmethod
+    def validate_max_input_chars(cls, v: int) -> int:
+        """Validate max input chars is positive."""
+        if v <= 0:
+            raise ValueError('Input character limits must be greater than 0')
+        return v
+    
+    @field_validator('max_docx_archive_entries')
+    @classmethod
+    def validate_max_docx_archive_entries(cls, v: int) -> int:
+        """Validate max DOCX archive entries is positive."""
+        if v <= 0:
+            raise ValueError('MAX_DOCX_ARCHIVE_ENTRIES must be greater than 0')
+        return v
+    
+    @field_validator('max_docx_archive_uncompressed_bytes', 'max_docx_archive_entry_bytes',
+                   'max_docx_xml_bytes')
+    @classmethod
+    def validate_max_bytes(cls, v: int) -> int:
+        """Validate max bytes values are positive."""
+        if v <= 0:
+            raise ValueError('Byte limits must be greater than 0')
+        return v
+    
+    @field_validator('max_docx_archive_ratio')
+    @classmethod
+    def validate_max_docx_archive_ratio(cls, v: float) -> float:
+        """Validate max DOCX archive ratio is positive."""
+        if v <= 0:
+            raise ValueError('MAX_DOCX_ARCHIVE_RATIO must be greater than 0')
+        return v
+
+
+class RateLimitConfig(BaseSettings):
+    """Rate limiting configuration."""
+    
+    model_config = ConfigDict(env_prefix="", case_sensitive=False)
+    
+    rate_limit_backend: Literal["redis", "memory", "auto"] = Field(
+        default="auto",
+        description=(
+            "Rate limiting backend: 'redis' for distributed Redis, 'memory' for in-memory, "
+            "'auto' to automatically choose Redis if available, otherwise memory. "
+            "In production, 'redis' is recommended for distributed deployments."
+        )
+    )
+    rate_limit_period: int = Field(
+        default=60,
+        description="Rate limit period in seconds."
+    )
+    rate_limit_key_calls: int = Field(
+        default=300,
+        description="Rate limit calls per period for API keys."
+    )
+    rate_limit_ip_calls: int = Field(
+        default=60,
+        description="Rate limit calls per period for IP addresses."
+    )
+    trust_proxy_headers: bool = Field(
+        default=False,
+        description="Trust X-Forwarded-* headers for client IP detection."
+    )
+    require_redis_in_production: bool = Field(
+        default=False,
+        description="Require Redis for rate limiting in production environment. When enabled, application will fail to start if Redis is unavailable in production."
+    )
+    redis_fail_fast: bool = Field(
+        default=True,
+        description="Fail fast if Redis initialization fails. When enabled, application will fail to start if Redis URL is configured but connection fails."
+    )
+    
+    # Authentication rate limits
+    auth_login_rate_limit: int = Field(
+        default=5,
+        description="Rate limit for login attempts."
+    )
+    auth_login_rate_period: int = Field(
+        default=60,
+        description="Rate limit period for login attempts in seconds."
+    )
+    auth_login_failed_attempt_limit: int = Field(
+        default=10,
+        description="Failed login attempt limit."
+    )
+    auth_login_failed_attempt_period: int = Field(
+        default=300,
+        description="Failed login attempt period in seconds."
+    )
+    auth_login_lockout_duration: int = Field(
+        default=900,
+        description="Lockout duration after failed attempts in seconds."
+    )
+    auth_signup_rate_limit: int = Field(
+        default=3,
+        description="Rate limit for signup attempts."
+    )
+    auth_signup_rate_period: int = Field(
+        default=3600,
+        description="Rate limit period for signup attempts in seconds."
+    )
+    auth_verification_rate_limit: int = Field(
+        default=3,
+        description="Rate limit for verification requests."
+    )
+    auth_verification_rate_period: int = Field(
+        default=3600,
+        description="Rate limit period for verification requests in seconds."
+    )
+    
+    # Comparison rate limits
+    compare_rate_limit_calls: int = Field(
+        default=60,
+        description="Rate limit calls for comparison requests."
+    )
+    compare_rate_limit_period: int = Field(
+        default=60,
+        description="Rate limit period for comparison requests in seconds."
+    )
+    
+    @model_validator(mode='after')
+    def validate_redis_config_environment(self):
+        """Ensure Redis configuration is appropriate for environment."""
+        # This validator runs on RateLimitConfig, so we need to get environment from os
+        environment = os.getenv("ENVIRONMENT", "production")
+        test_mode_str = os.getenv("TEST_MODE", "false")
+        test_mode = test_mode_str.lower() in ("true", "1", "yes")
+        
+        # Skip Redis requirement in test mode
+        if environment == "production" and self.require_redis_in_production and not test_mode:
+            redis_url = os.getenv("REDIS_URL")
+            if not redis_url:
+                raise ValueError(
+                    "REQUIRE_REDIS_IN_PRODUCTION is enabled but REDIS_URL is not set. "
+                    "Redis is required for distributed rate limiting in production. "
+                    "Set REDIS_URL or disable REQUIRE_REDIS_IN_PRODUCTION."
+                )
+        
+        # Validate backend selection against environment
+        if environment == "production" and self.rate_limit_backend == "memory" and not test_mode:
+            logger.warning(
+                "RATE_LIMIT_BACKEND is set to 'memory' in production environment. "
+                "Rate limiting will be process-local only, which is unsafe for distributed deployments. "
+                "Consider setting RATE_LIMIT_BACKEND to 'redis' for distributed rate limiting."
+            )
+        
+        return self
+    
+    @field_validator('rate_limit_period', 'auth_login_rate_period', 
+                   'auth_login_failed_attempt_period', 'auth_login_lockout_duration',
+                   'auth_signup_rate_period', 'auth_verification_rate_period',
+                   'compare_rate_limit_period')
+    @classmethod
+    def validate_rate_limit_periods(cls, v: int) -> int:
+        """Validate rate limit periods are positive."""
+        if v <= 0:
+            raise ValueError('Rate limit periods must be greater than 0')
+        return v
+    
+    @field_validator('rate_limit_key_calls', 'rate_limit_ip_calls',
+                   'auth_login_rate_limit', 'auth_login_failed_attempt_limit',
+                   'auth_signup_rate_limit', 'auth_verification_rate_limit',
+                   'compare_rate_limit_calls')
+    @classmethod
+    def validate_rate_limit_calls(cls, v: int) -> int:
+        """Validate rate limit call counts are positive."""
+        if v <= 0:
+            raise ValueError('Rate limit call counts must be greater than 0')
+        return v
+
+
+class AIConfig(BaseSettings):
+    """AI service configuration."""
+    
+    model_config = ConfigDict(env_prefix="", case_sensitive=False)
+    
+    bytez_api_key: Optional[str] = Field(
+        default=None,
+        description="API key for Bytez AI service."
+    )
+    chat_model: str = Field(
+        default="Equall/Saul-7B-Instruct-v1",
+        description="Model name for chat requests."
+    )
+    summarize_model: str = Field(
+        default="Equall/Saul-7B-Instruct-v1",
+        description="Model name for summarization requests."
+    )
+    max_model_input_chars: int = Field(
+        default=15000,
+        description="Maximum characters for model input."
+    )
+    provider_timeout: float = Field(
+        default=30.0,
+        description="Timeout in seconds for AI provider requests."
+    )
+    provider_retries: int = Field(
+        default=3,
+        description="Number of retries for AI provider requests."
+    )
+    retry_backoff_factor: float = Field(
+        default=2.0,
+        description="Backoff factor for retry attempts."
+    )
+    graceful_degradation: bool = Field(
+        default=True,
+        description="Enable graceful degradation when AI service is unavailable."
+    )
+    stub_mode: bool = Field(
+        default=False,
+        description="Enable stub mode for testing without AI service."
+    )
+    health_debug: bool = Field(
+        default=False,
+        description="Enable debug information in health endpoint."
+    )
+    rag_init_retry_interval: int = Field(
+        default=300,
+        description="Cooldown in seconds before retrying RAG initialization after a failure."
+    )
+    rag_enable_auto_recovery: bool = Field(
+        default=True,
+        description="Enable automatic retry of failed RAG initialization after the cooldown expires."
+    )
+    rag_max_init_retries: int = Field(
+        default=3,
+        description="Maximum number of initialization attempts before treating the RAG service as permanently degraded."
+    )
+    
+    @field_validator('max_model_input_chars')
+    @classmethod
+    def validate_max_model_input_chars(cls, v: int) -> int:
+        """Validate max model input chars is positive."""
+        if v <= 0:
+            raise ValueError('MAX_MODEL_INPUT_CHARS must be greater than 0')
+        return v
+    
+    @field_validator('provider_timeout')
+    @classmethod
+    def validate_provider_timeout(cls, v: float) -> float:
+        """Validate provider timeout is positive and reasonable."""
+        if v <= 0:
+            raise ValueError('PROVIDER_TIMEOUT must be greater than 0')
+        if v > 600:  # 10 minutes
+            logger.warning(
+                f"PROVIDER_TIMEOUT ({v}s) is very large. "
+                "Consider setting a lower limit to prevent hanging requests."
+            )
+        return v
+    
+    @field_validator('provider_retries')
+    @classmethod
+    def validate_provider_retries(cls, v: int) -> int:
+        """Validate provider retries is positive and reasonable."""
+        if v <= 0:
+            raise ValueError('PROVIDER_RETRIES must be greater than 0')
+        if v > 10:
+            logger.warning(
+                f"PROVIDER_RETRIES ({v}) is very large. "
+                "Consider setting a lower limit to prevent excessive retries."
+            )
+        return v
+    
+    @field_validator('retry_backoff_factor')
+    @classmethod
+    def validate_retry_backoff_factor(cls, v: float) -> float:
+        """Validate retry backoff factor is positive."""
+        if v <= 0:
+            raise ValueError('RETRY_BACKOFF_FACTOR must be greater than 0')
+        return v
+
+    @field_validator('rag_init_retry_interval')
+    @classmethod
+    def validate_rag_init_retry_interval(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError('RAG_INIT_RETRY_INTERVAL must be greater than or equal to 0')
+        return v
+
+    @field_validator('rag_max_init_retries')
+    @classmethod
+    def validate_rag_max_init_retries(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError('RAG_MAX_INIT_RETRIES must be greater than or equal to 0')
+        return v
+    
+    @model_validator(mode='after')
+    def validate_ai_config_environment(self):
+        """Ensure AI configuration is appropriate for environment."""
+        environment = os.getenv("ENVIRONMENT", "production")
+        bytez_api_key = self.bytez_api_key
+        stub_mode = self.stub_mode
+        
+        if environment == "production" and not bytez_api_key and not stub_mode:
+            logger.warning(
+                "BYTEZ_API_KEY is not set in production environment. "
+                "AI features will be unavailable or run in degraded mode."
+            )
+        
+        return self
+
+
+class ComparisonConfig(BaseSettings):
+    """Document comparison configuration."""
+    
+    model_config = ConfigDict(env_prefix="", case_sensitive=False)
+    
+    compare_max_context_chars: int = Field(
+        default=14000,
+        description="Maximum characters for comparison context."
+    )
+    compare_max_documents: int = Field(
+        default=10,
+        description="Maximum number of documents for comparison."
+    )
+    
+    @field_validator('compare_max_context_chars')
+    @classmethod
+    def validate_compare_max_context_chars(cls, v: int) -> int:
+        """Validate comparison max context chars is positive."""
+        if v <= 0:
+            raise ValueError('COMPARE_MAX_CONTEXT_CHARS must be greater than 0')
+        return v
+    
+    @field_validator('compare_max_documents')
+    @classmethod
+    def validate_compare_max_documents(cls, v: int) -> int:
+        """Validate comparison max documents is positive and reasonable."""
+        if v < 2:
+            raise ValueError('COMPARE_MAX_DOCUMENTS must be at least 2')
+        if v > 50:
+            logger.warning(
+                f"COMPARE_MAX_DOCUMENTS ({v}) is very large. "
+                "Consider setting a lower limit to prevent processing timeouts."
+            )
+        return v
+
+
+class CORSConfig(BaseSettings):
+    """CORS configuration."""
+
+    model_config = ConfigDict(env_prefix="", case_sensitive=False)
+
+    allowed_origins: str = Field(
+        default="http://localhost:5173",
+        description="Comma-separated list of allowed CORS origins."
+    )
+    frontend_url: str = Field(
+        default="http://localhost:5173",
+        description="Frontend URL for CORS (fallback for allowed_origins)."
+    )
+    allow_localhost_cors: bool = Field(
+        default=False,
+        description=(
+            "When enabled, automatically adds common localhost development ports "
+            "(5173-5180 on both localhost and 127.0.0.1) to the CORS allowlist. "
+            "Default is false for security. Localhost origins are never added automatically "
+            "without this explicit configuration."
+        )
+    )
+
+
+class EncryptionConfig(BaseSettings):
+    """Configuration for at-rest encryption of stored contract content."""
+
+    model_config = ConfigDict(env_prefix="", case_sensitive=False)
+
+    document_encryption_key: Optional[str] = Field(
+        default=None,
+        description=(
+            "Secret used to derive the key that encrypts contract content at "
+            "rest (document summaries, clause analysis, chat messages). "
+            "Required in production to ensure cryptographic key separation. "
+            "In non-production environments (development, testing, local), "
+            "falls back to JWT_SECRET_KEY if not set."
+        ),
+    )
+    strict_encryption_mode: bool = Field(
+        default=False,
+        description=(
+            "When enabled, requires all stored values to be properly encrypted. "
+            "Legacy plaintext data will raise DecryptionError instead of being "
+            "returned unchanged. Recommended for production environments after "
+            "all legacy data has been migrated to encrypted format. "
+            "When disabled (default), legacy plaintext is returned unchanged "
+            "with DEBUG-level logging for backward compatibility."
+        ),
+    )
+
+    @model_validator(mode='after')
+    def validate_encryption_key_in_production(self):
+        """Ensure DOCUMENT_ENCRYPTION_KEY is set in production environment or fallback gracefully."""
+        environment = os.getenv("ENVIRONMENT", "production")
+        test_mode_str = os.getenv("TEST_MODE", "false")
+        test_mode = test_mode_str.lower() in ("true", "1", "yes")
+        
+        if environment == "production" and not self.document_encryption_key and not test_mode:
+            logger.warning(
+                "DOCUMENT_ENCRYPTION_KEY is not set in production. "
+                "Falling back to JWT_SECRET_KEY for document encryption. "
+                "For optimal security, set a distinct DOCUMENT_ENCRYPTION_KEY."
+            )
+            self.document_encryption_key = os.getenv("JWT_SECRET_KEY")
+        
+        return self
+
+
+class Settings(BaseSettings):
+    """
+    Main application settings class that aggregates all configuration sections.
+    
+    This is the single source of truth for all environment configuration.
+    All validation happens at initialization, ensuring invalid configurations
+    fail fast with clear error messages.
+    """
+    
+    model_config = ConfigDict(env_prefix="", case_sensitive=False)
+    
+    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
+    environment: EnvironmentConfig = Field(
+        default_factory=EnvironmentConfig,
+        validation_alias="ENVIRONMENT_SECTION_DO_NOT_MATCH_DIRECTLY"
+    )
+    file_upload: FileUploadConfig = Field(default_factory=FileUploadConfig)
+    input_validation: InputValidationConfig = Field(default_factory=InputValidationConfig)
+    rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
+    ai: AIConfig = Field(default_factory=AIConfig)
+    comparison: ComparisonConfig = Field(default_factory=ComparisonConfig)
+    cors: CORSConfig = Field(default_factory=CORSConfig)
+    encryption: EncryptionConfig = Field(default_factory=EncryptionConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def format_environment_input(cls, data):
+        if isinstance(data, dict):
+            if "environment" in data:
+                data = dict(data)
+                data["ENVIRONMENT_SECTION_DO_NOT_MATCH_DIRECTLY"] = data.pop("environment")
+        return data
+
+
+# Global settings instance
+_settings: Optional[Settings] = None
+
+
+def get_settings() -> Settings:
+    """
+    Get the global settings instance.
+    
+    Initializes settings on first call and validates all configuration.
+    Raises ValidationError if configuration is invalid.
+    
+    Returns:
+        Settings: The validated settings instance.
+    
+    Raises:
+        ValidationError: If configuration is invalid.
+    """
+    global _settings
+    
+    if _settings is not None:
+        env_in_os = os.getenv("ENVIRONMENT")
+        redis_in_os = os.getenv("REDIS_URL")
+        backend_in_os = os.getenv("RATE_LIMIT_BACKEND")
+        fail_fast_in_os = os.getenv("REDIS_FAIL_FAST")
+        req_redis_in_os = os.getenv("REQUIRE_REDIS_IN_PRODUCTION")
+        test_in_os = os.getenv("TEST_MODE")
+        jwt_in_os = os.getenv("JWT_SECRET_KEY")
+
+        cached_env = _settings.environment.environment
+        cached_redis = _settings.database.redis_url
+        cached_backend = _settings.rate_limit.rate_limit_backend
+        cached_fail_fast = "true" if _settings.rate_limit.redis_fail_fast else "false"
+        cached_req_redis = "true" if _settings.rate_limit.require_redis_in_production else "false"
+        cached_test = "true" if _settings.environment.test_mode else "false"
+        cached_jwt = _settings.security.jwt_secret_key
+
+        if (
+            (env_in_os is not None and env_in_os.lower() != cached_env.lower())
+            or (redis_in_os != cached_redis)
+            or (backend_in_os is not None and backend_in_os.lower() != cached_backend.lower())
+            or (fail_fast_in_os is not None and fail_fast_in_os.lower() != cached_fail_fast)
+            or (req_redis_in_os is not None and req_redis_in_os.lower() != cached_req_redis)
+            or (test_in_os is not None and test_in_os.lower() != cached_test)
+            or (jwt_in_os is not None and jwt_in_os != cached_jwt)
+        ):
+            _settings = None
+
+    if _settings is None:
+        try:
+            _settings = Settings()
+            logger.info("Configuration loaded and validated successfully")
+        except ValidationError as e:
+            logger.error(f"Configuration validation failed: {e}")
+            raise
+    
+    return _settings
+
+
+def validate_config() -> None:
+    """
+    Validate configuration without initializing the global settings instance.
+    
+    This is useful for testing configuration without side effects.
+    
+    Raises:
+        ValidationError: If configuration is invalid.
+    """
+    try:
+        Settings()
+        logger.info("Configuration validation passed")
+    except ValidationError as e:
+        logger.error(f"Configuration validation failed: {e}")
+        raise
+
+
+# Convenience functions for backward compatibility
+def get_database_url() -> Optional[str]:
+    """Get database URL from settings."""
+    return get_settings().database.database_url
+
+
+def get_jwt_secret_key() -> str:
+    """Get JWT secret key from settings."""
+    return get_settings().security.jwt_secret_key
+
+
+def is_production() -> bool:
+    """Check if running in production environment."""
+    return get_settings().environment.environment == "production"
+
+
+def is_development() -> bool:
+    """Check if running in development environment."""
+    return get_settings().environment.environment == "development"
+
+
+def is_test_mode() -> bool:
+    """Check if test mode is enabled."""
+    return get_settings().environment.test_mode
